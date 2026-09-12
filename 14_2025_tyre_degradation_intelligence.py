@@ -22,7 +22,13 @@ import fastf1
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor, VotingRegressor
+from sklearn.ensemble import (
+    ExtraTreesRegressor,
+    GradientBoostingRegressor,
+    HistGradientBoostingRegressor,
+    RandomForestRegressor,
+    VotingRegressor,
+)
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import mean_absolute_error
 from sklearn.model_selection import GroupKFold
@@ -220,10 +226,25 @@ def get_features() -> tuple[list[str], list[str]]:
         "AirTemp",
         "Fuel_Weight_kg",
         "Stint_Length",
+        "TyreLife_x_Compound",
+        "TyreLife_x_Abrasion",
+        "TyreLife_x_Stress",
+        "Temp_x_Stress",
+        "Grip_x_Traction",
         *PROFILE_COLUMNS,
     ]
     categorical = ["Driver", "Race"]
     return numeric, categorical
+
+
+def enrich_features(df: pd.DataFrame) -> pd.DataFrame:
+    enriched = df.copy()
+    enriched["TyreLife_x_Compound"] = enriched["TyreLife"] * enriched["Compound_C_Rating"]
+    enriched["TyreLife_x_Abrasion"] = enriched["TyreLife"] * enriched["asphalt_abrasion"]
+    enriched["TyreLife_x_Stress"] = enriched["TyreLife"] * enriched["tyre_stress"]
+    enriched["Temp_x_Stress"] = enriched["TrackTemp"] * enriched["tyre_stress"]
+    enriched["Grip_x_Traction"] = enriched["asphalt_grip"] * enriched["traction"]
+    return enriched
 
 
 def make_onehot_encoder() -> OneHotEncoder:
@@ -244,10 +265,12 @@ def build_model_pipeline() -> Pipeline:
     )
     model = VotingRegressor(
         estimators=[
-            ("gbr", GradientBoostingRegressor(random_state=42, n_estimators=300, learning_rate=0.04, max_depth=3)),
-            ("rf", RandomForestRegressor(random_state=42, n_estimators=250, min_samples_leaf=4, n_jobs=-1)),
+            ("gbr", GradientBoostingRegressor(random_state=42, n_estimators=450, learning_rate=0.03, max_depth=3)),
+            ("hgb", HistGradientBoostingRegressor(random_state=42, max_depth=8, learning_rate=0.03, max_iter=450, min_samples_leaf=20)),
+            ("rf", RandomForestRegressor(random_state=42, n_estimators=500, min_samples_leaf=3, n_jobs=-1)),
+            ("etr", ExtraTreesRegressor(random_state=42, n_estimators=500, min_samples_leaf=2, n_jobs=-1)),
         ],
-        weights=[0.65, 0.35],
+        weights=[0.28, 0.30, 0.22, 0.20],
     )
     return Pipeline([("preprocessor", preprocessor), ("model", model)])
 
@@ -333,6 +356,25 @@ def build_cliff_report(df: pd.DataFrame, pipeline: Pipeline) -> pd.DataFrame:
     return report.sort_values(["Race", "Driver", "Stint_ID"]).reset_index(drop=True)
 
 
+def build_tyre_wise_cliff_report(cliff_report: pd.DataFrame) -> pd.DataFrame:
+    if cliff_report.empty:
+        return pd.DataFrame()
+    tyre_summary = (
+        cliff_report.groupby("Compound", as_index=False)
+        .agg(
+            avg_cliff_lap=("cliff_lap", "mean"),
+            median_cliff_lap=("cliff_lap", "median"),
+            avg_loss_per_lap=("avg_loss_per_lap", "mean"),
+            peak_loss_per_lap=("peak_loss_per_lap", "max"),
+            stints=("Stint_ID", "count"),
+            races=("Race", "nunique"),
+        )
+        .sort_values("avg_loss_per_lap", ascending=False)
+        .reset_index(drop=True)
+    )
+    return tyre_summary
+
+
 def save_model_bundle(path: Path, pipeline: Pipeline, metadata: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("wb") as fp:
@@ -400,6 +442,7 @@ def main() -> None:
     dataset = build_clean_degradation_dataset(raw)
     if dataset.empty:
         raise RuntimeError("No valid stints remained after cleaning.")
+    dataset = enrich_features(dataset)
 
     validate_set = {normalize_name(name) for name in args.validate_races}
     if validate_set:
@@ -459,12 +502,18 @@ def main() -> None:
     pred_all = np.clip(pipeline.predict(analysis_df[features]), 0.0, None)
     mae_all = float(mean_absolute_error(analysis_df["Degradation_Delta"], pred_all))
     race_mae = race_mae_table(analysis_df.assign(Pred=pred_all))
+    avg_race_mae = float(race_mae["MAE"].mean())
     race_mae_path = output_dir / f"race_mae_{args.year}.csv"
     race_mae.to_csv(race_mae_path, index=False)
 
     logging.info("Combined-driver MAE on analysis set: %.4fs", mae_all)
+    logging.info("Average race MAE: %.4fs", avg_race_mae)
     logging.info("Saved race MAE report to %s", race_mae_path)
     logging.info("Saved cliff report to %s", cliff_path)
+    tyre_wise_cliff = build_tyre_wise_cliff_report(cliff_report)
+    tyre_wise_path = output_dir / f"tyre_wise_cliff_report_{args.year}.csv"
+    tyre_wise_cliff.to_csv(tyre_wise_path, index=False)
+    logging.info("Saved tyre-wise cliff report to %s", tyre_wise_path)
     if not cliff_report.empty:
         summary = (
             cliff_report.groupby("Race", as_index=False)
