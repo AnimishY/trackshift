@@ -1,0 +1,170 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 7 0 R >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 1711 >>
+stream
+BT
+/F1 17 Tf
+50 760 Td
+/F1 10 Tf
+(METHODLOGY AND WEIGHT PRIORS) Tj
+0 -16 Td
+/F1 10 Tf
+(Beyond Curve Fitting: Virtual Sensors and Probabilistic Tyre Intelligence) Tj
+0 -16 Td
+/F1 10 Tf
+(1. Decision objective) Tj
+0 -16 Td
+/F1 10 Tf
+(The system estimates a hidden tyre degradation state from fuel-corrected green-flag lap) Tj
+0 -16 Td
+/F1 10 Tf
+(times. It reports the probability that pace loss exceeds a 1.5 s cliff threshold, rather) Tj
+0 -16 Td
+/F1 10 Tf
+(than only a point lap-time prediction.) Tj
+0 -16 Td
+/F1 10 Tf
+(2. Public-data virtual sensors) Tj
+0 -16 Td
+/F1 10 Tf
+(FastF1 does not provide private tyre CAN data. Track temperature, track profile and vehicle-) Tj
+0 -16 Td
+/F1 10 Tf
+(dynamics priors create reproducible thermal-stress, pressure-deviation, slip-energy,) Tj
+0 -16 Td
+/F1 10 Tf
+(lateral-load, brake-thermal and aero-load indices. Inputs and formulae are visible in) Tj
+0 -16 Td
+/F1 10 Tf
+(tyre_features.py.) Tj
+0 -16 Td
+/F1 10 Tf
+(3. State-space model) Tj
+0 -16 Td
+/F1 10 Tf
+(State x = [degradation seconds, degradation-rate seconds/lap]. The transition advances state) Tj
+0 -16 Td
+/F1 10 Tf
+(with tyre age. The observation is fuel-corrected degradation delta. A Kalman posterior) Tj
+0 -16 Td
+/F1 10 Tf
+(supplies mean and covariance; innovation clipping limits traffic, lock-up and driver-error) Tj
+0 -16 Td
+/F1 10 Tf
+(outliers.) Tj
+0 -16 Td
+/F1 10 Tf
+(4. Uncertainty) Tj
+0 -16 Td
+/F1 10 Tf
+(Forecasts propagate covariance into 70% \(15th-85th\) and 90% \(5th-95th\) fan-chart bands.) Tj
+0 -16 Td
+/F1 10 Tf
+(Cliff probability is P\(degradation > threshold\), computed from the forecast normal) Tj
+0 -16 Td
+/F1 10 Tf
+(distribution. Intervals are uncertainty estimates, not guarantees.) Tj
+ET
+endstream
+endobj
+5 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 7 0 R >> >> /Contents 6 0 R >>
+endobj
+6 0 obj
+<< /Length 1953 >>
+stream
+BT
+/F1 17 Tf
+50 760 Td
+/F1 12 Tf
+(WEIGHT PRIOR RATIONALE AND VALIDATION) Tj
+0 -16 Td
+/F1 10 Tf
+(5. Initial virtual-sensor prior weights) Tj
+0 -16 Td
+/F1 10 Tf
+(Slip 0.16, thermal 0.16 and lateral 0.14 are highest because contact-patch shear and heat) Tj
+0 -16 Td
+/F1 10 Tf
+(are primary wear mechanisms. Pressure 0.10, aero 0.09, brake and vertical load 0.08 modify) Tj
+0 -16 Td
+/F1 10 Tf
+(operating conditions. Camber 0.06, differential 0.05, toe and brake bias 0.04 are lower-) Tj
+0 -16 Td
+/F1 10 Tf
+(confidence setup modifiers.) Tj
+0 -16 Td
+/F1 10 Tf
+(The weights are explicitly priors, not proprietary F1 measurements.) Tj
+0 -16 Td
+/F1 10 Tf
+(update_wear_weight_priors applies only bounded, renormalised weekend evidence updates. This) Tj
+0 -16 Td
+/F1 10 Tf
+(prevents a few noisy practice laps from overwriting the physical hierarchy.) Tj
+0 -16 Td
+/F1 10 Tf
+(6. Validation protocol) Tj
+0 -16 Td
+/F1 10 Tf
+(Hold out entire races, fit the global rate/noise prior on the remaining races, then score) Tj
+0 -16 Td
+/F1 10 Tf
+(one-step-ahead pre-update predictions. For a race plot, overlay actual fuel-corrected) Tj
+0 -16 Td
+/F1 10 Tf
+(degradation with the 70%/90% bands and report held-out interval coverage alongside MAE.) Tj
+0 -16 Td
+/F1 10 Tf
+(7. References and limits) Tj
+0 -16 Td
+/F1 10 Tf
+(H.B. Pacejka, Tire and Vehicle Dynamics, 3rd ed., Butterworth-Heinemann, 2012. TRICK) Tj
+0 -16 Td
+/F1 10 Tf
+(tyre/road interaction work by Farroni et al. is the motivation for thermal and wear proxy) Tj
+0 -16 Td
+/F1 10 Tf
+(modelling. The project brief also identifies recent FastF1 latent-state preprints; verify) Tj
+0 -16 Td
+/F1 10 Tf
+(final bibliographic metadata before submission.) Tj
+0 -16 Td
+/F1 10 Tf
+(This prototype never represents virtual sensors as measured competitor telemetry. Wet laps,) Tj
+0 -16 Td
+/F1 10 Tf
+(safety-car laps, pit in/out laps and obvious slow-lap outliers are excluded from the base) Tj
+0 -16 Td
+/F1 10 Tf
+(observations.) Tj
+ET
+endstream
+endobj
+7 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+xref
+0 8
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000121 00000 n 
+0000000247 00000 n 
+0000002010 00000 n 
+0000002136 00000 n 
+0000004141 00000 n 
+trailer
+<< /Size 8 /Root 1 0 R >>
+startxref
+4211
+%%EOF

@@ -3,9 +3,9 @@
 This script:
 1) downloads race laps for every available 2025 grand prix via FastF1,
 2) merges external track/tyre-allocation factors from a CSV,
-3) trains a combined-driver degradation model,
-4) reports MAE and saves tyre cliff / loss-per-lap analysis,
-5) saves a reusable model bundle for later race validation.
+3) fits a probabilistic latent tyre-state prior,
+4) reports uncertainty-aware tyre cliff / loss-per-lap analysis,
+5) saves a reusable state-space model bundle for later race validation.
 """
 
 from __future__ import annotations
@@ -21,13 +21,11 @@ from typing import Iterable
 import fastf1
 import numpy as np
 import pandas as pd
-from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor, VotingRegressor
-from sklearn.impute import SimpleImputer
 from sklearn.metrics import mean_absolute_error
 from sklearn.model_selection import GroupKFold
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+from tyre_features import ENGINEERING_FEATURE_COLUMNS, PROFILE_COLUMNS, derive_race_sensor_proxies
+from latent_tyre_model import LatentTyreModel, fit_latent_tyre_model, infer_dataset
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -36,17 +34,6 @@ CACHE_DIR = Path("cache")
 DEFAULT_MODEL_PATH = Path("models/tyre_degradation_2025.pkl")
 DEFAULT_OUTPUT_DIR = Path("outputs")
 RELATIVE_COMPOUNDS = {"SOFT", "MEDIUM", "HARD"}
-
-PROFILE_COLUMNS = [
-    "traction",
-    "asphalt_grip",
-    "asphalt_abrasion",
-    "track_evolution",
-    "tyre_stress",
-    "braking",
-    "lateral",
-    "downforce",
-]
 
 ALIAS_MAP = {
     "GREAT BRITAIN": "BRITISH",
@@ -209,6 +196,7 @@ def build_clean_degradation_dataset(df: pd.DataFrame) -> pd.DataFrame:
     clean["TyreLife"] = pd.to_numeric(clean["TyreLife"], errors="coerce")
     clean["TrackTemp"] = clean["TrackTemp"].fillna(clean["TrackTemp"].median())
     clean["AirTemp"] = clean["AirTemp"].fillna(clean["AirTemp"].median())
+    clean = derive_race_sensor_proxies(clean)
     return clean.dropna(subset=["TyreLife", "Compound_C_Rating", "Degradation_Delta"])
 
 
@@ -221,47 +209,20 @@ def get_features() -> tuple[list[str], list[str]]:
         "Fuel_Weight_kg",
         "Stint_Length",
         *PROFILE_COLUMNS,
+        *ENGINEERING_FEATURE_COLUMNS,
     ]
     categorical = ["Driver", "Race"]
     return numeric, categorical
 
 
-def make_onehot_encoder() -> OneHotEncoder:
-    """Build a dense OneHotEncoder across sklearn versions."""
-    try:
-        return OneHotEncoder(handle_unknown="ignore", sparse_output=False)
-    except TypeError:
-        return OneHotEncoder(handle_unknown="ignore", sparse=False)
-
-
-def build_model_pipeline() -> Pipeline:
-    numeric, categorical = get_features()
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ("num", Pipeline([("imputer", SimpleImputer(strategy="median")), ("scale", StandardScaler())]), numeric),
-            ("cat", Pipeline([("imputer", SimpleImputer(strategy="most_frequent")), ("onehot", make_onehot_encoder())]), categorical),
-        ]
-    )
-    model = VotingRegressor(
-        estimators=[
-            ("gbr", GradientBoostingRegressor(random_state=42, n_estimators=300, learning_rate=0.04, max_depth=3)),
-            ("rf", RandomForestRegressor(random_state=42, n_estimators=250, min_samples_leaf=4, n_jobs=-1)),
-        ],
-        weights=[0.65, 0.35],
-    )
-    return Pipeline([("preprocessor", preprocessor), ("model", model)])
-
-
-def evaluate_group_cv(df: pd.DataFrame, pipeline: Pipeline) -> tuple[float, pd.DataFrame]:
-    numeric, categorical = get_features()
-    features = numeric + categorical
-    X = df[features]
-    y = df["Degradation_Delta"].to_numpy()
+def evaluate_group_cv(df: pd.DataFrame) -> tuple[float, pd.DataFrame]:
+    """Race-held-out one-step-ahead MAE for the probabilistic filter."""
+    y = df["Degradation_Delta"].to_numpy(float)
     groups = df["Race"]
     n_groups = groups.nunique()
     splits = min(5, n_groups)
     if splits < 2:
-        predictions = np.clip(pipeline.fit(X, y).predict(X), 0.0, None)
+        predictions = infer_dataset(df, fit_latent_tyre_model(df))["Prior_Degradation_Mean"].to_numpy()
         mae = float(mean_absolute_error(y, predictions))
         race_mae = pd.DataFrame({"Race": [groups.iloc[0]], "MAE": [mae], "Laps": [len(df)]})
         return mae, race_mae
@@ -269,13 +230,12 @@ def evaluate_group_cv(df: pd.DataFrame, pipeline: Pipeline) -> tuple[float, pd.D
     gkf = GroupKFold(n_splits=splits)
     oof = np.full(shape=len(df), fill_value=np.nan, dtype=float)
     rows = []
-    for fold, (train_idx, test_idx) in enumerate(gkf.split(X, y, groups)):
-        X_train, y_train = X.iloc[train_idx], y[train_idx]
-        X_test, y_test = X.iloc[test_idx], y[test_idx]
-        pipeline.fit(X_train, y_train)
-        pred = np.clip(pipeline.predict(X_test), 0.0, None)
+    for fold, (train_idx, test_idx) in enumerate(gkf.split(df, y, groups)):
+        test_df = df.iloc[test_idx]
+        model = fit_latent_tyre_model(df.iloc[train_idx])
+        pred = infer_dataset(test_df, model)["Prior_Degradation_Mean"].to_numpy()
         oof[test_idx] = pred
-        fold_mae = float(mean_absolute_error(y_test, pred))
+        fold_mae = float(mean_absolute_error(y[test_idx], pred))
         race_name = groups.iloc[test_idx].mode().iat[0]
         rows.append({"Fold": fold + 1, "Race": race_name, "MAE": fold_mae, "Laps": len(test_idx)})
 
@@ -310,12 +270,11 @@ def detect_cliff_and_loss(stint: pd.DataFrame, predictions: np.ndarray) -> dict[
     }
 
 
-def build_cliff_report(df: pd.DataFrame, pipeline: Pipeline) -> pd.DataFrame:
-    numeric, categorical = get_features()
-    features = numeric + categorical
+def build_cliff_report(df: pd.DataFrame, model: LatentTyreModel) -> pd.DataFrame:
     rows = []
     for stint_id, stint in df.groupby("Stint_ID", sort=False):
-        pred = pipeline.predict(stint[features])
+        inferred = model.infer_stint(stint)
+        pred = inferred["Latent_Degradation_Mean"].to_numpy()
         metrics = detect_cliff_and_loss(stint, pred)
         rows.append(
             {
@@ -333,16 +292,20 @@ def build_cliff_report(df: pd.DataFrame, pipeline: Pipeline) -> pd.DataFrame:
     return report.sort_values(["Race", "Driver", "Stint_ID"]).reset_index(drop=True)
 
 
-def save_model_bundle(path: Path, pipeline: Pipeline, metadata: dict) -> None:
+def save_model_bundle(path: Path, model: LatentTyreModel, metadata: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("wb") as fp:
-        pickle.dump({"pipeline": pipeline, "metadata": metadata}, fp)
+        pickle.dump({"model": model, "metadata": metadata}, fp)
 
 
-def load_model_bundle(path: Path) -> tuple[Pipeline, dict]:
+def load_model_bundle(path: Path) -> tuple[LatentTyreModel, dict]:
     with path.open("rb") as fp:
         bundle = pickle.load(fp)
-    return bundle["pipeline"], bundle.get("metadata", {})
+    # Version guard gives users a useful message when opening a pre-pivot
+    # VotingRegressor bundle.
+    if "model" not in bundle:
+        raise ValueError("This is a legacy deterministic model bundle. Re-run training to create a latent-state bundle.")
+    return bundle["model"], bundle.get("metadata", {})
 
 
 def race_mae_table(df: pd.DataFrame, prediction_column: str = "Pred") -> pd.DataFrame:
@@ -408,27 +371,22 @@ def main() -> None:
         validation_mask = pd.Series(False, index=dataset.index)
 
     if args.load_model:
-        pipeline, metadata = load_model_bundle(args.model_path)
+        model, metadata = load_model_bundle(args.model_path)
         logging.info("Loaded model from %s", args.model_path)
         logging.info("Stored metadata: %s", json.dumps(metadata, indent=2))
     else:
-        pipeline = build_model_pipeline()
         if validation_mask.any():
             train_df = dataset[~validation_mask].reset_index(drop=True)
             val_df = dataset[validation_mask].reset_index(drop=True)
-            numeric, categorical = get_features()
-            features = numeric + categorical
-            pipeline.fit(train_df[features], train_df["Degradation_Delta"])
-            val_pred = np.clip(pipeline.predict(val_df[features]), 0.0, None)
+            model = fit_latent_tyre_model(train_df)
+            val_pred = infer_dataset(val_df, model)["Prior_Degradation_Mean"].to_numpy()
             val_mae = float(mean_absolute_error(val_df["Degradation_Delta"], val_pred))
             race_val = race_mae_table(val_df.assign(Pred=val_pred))
             cv_mae = np.nan
             logging.info("Validation MAE on held-out races: %.4fs", val_mae)
         else:
-            cv_mae, race_cv = evaluate_group_cv(dataset, pipeline)
-            numeric, categorical = get_features()
-            features = numeric + categorical
-            pipeline.fit(dataset[features], dataset["Degradation_Delta"])
+            cv_mae, race_cv = evaluate_group_cv(dataset)
+            model = fit_latent_tyre_model(dataset)
             logging.info("Cross-race MAE (GroupKFold): %.4fs", cv_mae)
             logging.info("Best race-level CV MAE snapshot:\n%s", race_cv.head(5).to_string(index=False))
 
@@ -439,7 +397,7 @@ def main() -> None:
             "drivers": sorted(dataset["Driver"].unique().tolist()),
             "cv_or_validation_mae": None if np.isnan(cv_mae) else float(cv_mae),
         }
-        save_model_bundle(args.model_path, pipeline, metadata)
+        save_model_bundle(args.model_path, model, metadata)
         logging.info("Saved model bundle to %s", args.model_path)
 
     output_dir = args.output_dir
@@ -450,19 +408,21 @@ def main() -> None:
     else:
         analysis_df = dataset.copy()
 
-    cliff_report = build_cliff_report(analysis_df, pipeline)
+    cliff_report = build_cliff_report(analysis_df, model)
     cliff_path = output_dir / f"tyre_cliff_report_{args.year}.csv"
     cliff_report.to_csv(cliff_path, index=False)
 
-    numeric, categorical = get_features()
-    features = numeric + categorical
-    pred_all = np.clip(pipeline.predict(analysis_df[features]), 0.0, None)
+    inferred_analysis = infer_dataset(analysis_df, model)
+    pred_all = inferred_analysis["Prior_Degradation_Mean"].to_numpy()
+    stint_input_path = output_dir / f"latent_stint_observations_{args.year}.csv"
+    inferred_analysis.to_csv(stint_input_path, index=False)
     mae_all = float(mean_absolute_error(analysis_df["Degradation_Delta"], pred_all))
     race_mae = race_mae_table(analysis_df.assign(Pred=pred_all))
     race_mae_path = output_dir / f"race_mae_{args.year}.csv"
     race_mae.to_csv(race_mae_path, index=False)
 
     logging.info("Combined-driver MAE on analysis set: %.4fs", mae_all)
+    logging.info("Saved dashboard-ready stint observations to %s", stint_input_path)
     logging.info("Saved race MAE report to %s", race_mae_path)
     logging.info("Saved cliff report to %s", cliff_path)
     if not cliff_report.empty:
