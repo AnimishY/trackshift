@@ -21,17 +21,17 @@ from typing import Iterable
 import fastf1
 import numpy as np
 import pandas as pd
+from sklearn.base import BaseEstimator, RegressorMixin, clone
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import (
     ExtraTreesRegressor,
     GradientBoostingRegressor,
     HistGradientBoostingRegressor,
     RandomForestRegressor,
-    VotingRegressor,
 )
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import mean_absolute_error
-from sklearn.model_selection import GroupKFold
+from sklearn.model_selection import GroupKFold, KFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
@@ -255,6 +255,51 @@ def make_onehot_encoder() -> OneHotEncoder:
         return OneHotEncoder(handle_unknown="ignore", sparse=False)
 
 
+class DynamicWeightedRegressor(BaseEstimator, RegressorMixin):
+    """Learns ensemble weights from cross-validated base-model MAE."""
+
+    def __init__(self, estimators: list[tuple[str, BaseEstimator]], cv_splits: int = 4, random_state: int = 42):
+        self.estimators = estimators
+        self.cv_splits = cv_splits
+        self.random_state = random_state
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "DynamicWeightedRegressor":
+        X_arr = np.asarray(X)
+        y_arr = np.asarray(y, dtype=float)
+        self.estimators_ = [(name, clone(model)) for name, model in self.estimators]
+        maes_used = [np.nan] * len(self.estimators_)
+        if len(self.estimators_) == 1 or len(y_arr) < 20:
+            self.weights_ = np.array([1.0 / len(self.estimators_)] * len(self.estimators_), dtype=float)
+        else:
+            splits = max(2, min(self.cv_splits, len(y_arr) // 8))
+            kf = KFold(n_splits=splits, shuffle=True, random_state=self.random_state)
+            maes = []
+            for _, model in self.estimators_:
+                fold_maes = []
+                for train_idx, test_idx in kf.split(X_arr):
+                    model_fold = clone(model)
+                    model_fold.fit(X_arr[train_idx], y_arr[train_idx])
+                    pred = np.clip(model_fold.predict(X_arr[test_idx]), 0.0, None)
+                    fold_maes.append(mean_absolute_error(y_arr[test_idx], pred))
+                maes.append(float(np.mean(fold_maes)))
+            maes_used = maes
+            mae_arr = np.array(maes, dtype=float)
+            inv = 1.0 / np.clip(mae_arr, 1e-6, None)
+            self.weights_ = inv / inv.sum()
+        self.model_cv_mae_ = {
+            name: (float(mae) if not np.isnan(mae) else np.nan) for (name, _), mae in zip(self.estimators_, maes_used)
+        }
+        self.dynamic_weights_ = {name: float(weight) for (name, _), weight in zip(self.estimators_, self.weights_)}
+        for _, model in self.estimators_:
+            model.fit(X_arr, y_arr)
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        X_arr = np.asarray(X)
+        preds = np.column_stack([np.clip(model.predict(X_arr), 0.0, None) for _, model in self.estimators_])
+        return preds @ self.weights_
+
+
 def build_model_pipeline() -> Pipeline:
     numeric, categorical = get_features()
     preprocessor = ColumnTransformer(
@@ -263,14 +308,13 @@ def build_model_pipeline() -> Pipeline:
             ("cat", Pipeline([("imputer", SimpleImputer(strategy="most_frequent")), ("onehot", make_onehot_encoder())]), categorical),
         ]
     )
-    model = VotingRegressor(
+    model = DynamicWeightedRegressor(
         estimators=[
             ("gbr", GradientBoostingRegressor(random_state=42, n_estimators=450, learning_rate=0.03, max_depth=3)),
             ("hgb", HistGradientBoostingRegressor(random_state=42, max_depth=8, learning_rate=0.03, max_iter=450, min_samples_leaf=20)),
             ("rf", RandomForestRegressor(random_state=42, n_estimators=500, min_samples_leaf=3, n_jobs=-1)),
             ("etr", ExtraTreesRegressor(random_state=42, n_estimators=500, min_samples_leaf=2, n_jobs=-1)),
         ],
-        weights=[0.28, 0.30, 0.22, 0.20],
     )
     return Pipeline([("preprocessor", preprocessor), ("model", model)])
 
@@ -400,6 +444,14 @@ def race_mae_table(df: pd.DataFrame, prediction_column: str = "Pred") -> pd.Data
     return pd.DataFrame(rows).sort_values("MAE").reset_index(drop=True)
 
 
+def log_dynamic_weights(pipeline: Pipeline) -> None:
+    model = pipeline.named_steps.get("model")
+    weights = getattr(model, "dynamic_weights_", None)
+    if weights:
+        ordered = ", ".join(f"{name}={value:.3f}" for name, value in weights.items())
+        logging.info("Dynamic ensemble weights: %s", ordered)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--track-factors-csv", type=Path, required=True, help="CSV containing race-level factors and tyre allocations.")
@@ -454,6 +506,7 @@ def main() -> None:
         pipeline, metadata = load_model_bundle(args.model_path)
         logging.info("Loaded model from %s", args.model_path)
         logging.info("Stored metadata: %s", json.dumps(metadata, indent=2))
+        log_dynamic_weights(pipeline)
     else:
         pipeline = build_model_pipeline()
         if validation_mask.any():
@@ -462,6 +515,7 @@ def main() -> None:
             numeric, categorical = get_features()
             features = numeric + categorical
             pipeline.fit(train_df[features], train_df["Degradation_Delta"])
+            log_dynamic_weights(pipeline)
             val_pred = np.clip(pipeline.predict(val_df[features]), 0.0, None)
             val_mae = float(mean_absolute_error(val_df["Degradation_Delta"], val_pred))
             race_val = race_mae_table(val_df.assign(Pred=val_pred))
@@ -472,6 +526,7 @@ def main() -> None:
             numeric, categorical = get_features()
             features = numeric + categorical
             pipeline.fit(dataset[features], dataset["Degradation_Delta"])
+            log_dynamic_weights(pipeline)
             logging.info("Cross-race MAE (GroupKFold): %.4fs", cv_mae)
             logging.info("Best race-level CV MAE snapshot:\n%s", race_cv.head(5).to_string(index=False))
 
