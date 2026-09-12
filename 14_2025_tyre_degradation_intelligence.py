@@ -226,12 +226,20 @@ def get_features() -> tuple[list[str], list[str]]:
     return numeric, categorical
 
 
+def make_onehot_encoder() -> OneHotEncoder:
+    """Build a dense OneHotEncoder across sklearn versions."""
+    try:
+        return OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+    except TypeError:
+        return OneHotEncoder(handle_unknown="ignore", sparse=False)
+
+
 def build_model_pipeline() -> Pipeline:
     numeric, categorical = get_features()
     preprocessor = ColumnTransformer(
         transformers=[
             ("num", Pipeline([("imputer", SimpleImputer(strategy="median")), ("scale", StandardScaler())]), numeric),
-            ("cat", Pipeline([("imputer", SimpleImputer(strategy="most_frequent")), ("onehot", OneHotEncoder(handle_unknown="ignore", sparse=False))]), categorical),
+            ("cat", Pipeline([("imputer", SimpleImputer(strategy="most_frequent")), ("onehot", make_onehot_encoder())]), categorical),
         ]
     )
     model = VotingRegressor(
