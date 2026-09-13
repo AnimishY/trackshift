@@ -10,7 +10,6 @@ from __future__ import annotations
 import pickle
 from pathlib import Path
 import os
-import time
 
 try:
     import streamlit as st
@@ -31,6 +30,8 @@ from latent_tyre_model import LatentTyreModel, first_cliff_forecast
 from virtual_sensors import default_sensor_state, wear_load_breakdown
 
 
+MONO = "'JetBrains Mono', monospace"
+
 # Enable FastF1 Cache
 cache_dir = 'fastf1_cache'
 if not os.path.exists(cache_dir):
@@ -38,28 +39,71 @@ if not os.path.exists(cache_dir):
 fastf1.Cache.enable_cache(cache_dir)
 fastf1.plotting.setup_mpl(mpl_timedelta_support=False, misc_mpl_mods=False)
 
+# Official FastF1 event names, used directly as get_session() queries so a
+# track choice always resolves to the correct circuit (short country-style
+# names like "Great Britain" can resolve to the wrong event).
+DEMO_TRACK_CHOICES = [
+    "Bahrain Grand Prix", "Saudi Arabian Grand Prix", "Australian Grand Prix",
+    "Japanese Grand Prix", "Chinese Grand Prix", "Miami Grand Prix",
+    "Emilia Romagna Grand Prix", "Monaco Grand Prix", "Canadian Grand Prix",
+    "Spanish Grand Prix", "Austrian Grand Prix", "British Grand Prix",
+    "Hungarian Grand Prix", "Belgian Grand Prix", "Dutch Grand Prix",
+    "Italian Grand Prix", "Azerbaijan Grand Prix", "Singapore Grand Prix",
+    "United States Grand Prix", "Mexico City Grand Prix", "São Paulo Grand Prix",
+    "Las Vegas Grand Prix", "Qatar Grand Prix", "Abu Dhabi Grand Prix",
+]
+KNOWN_2025_DRIVERS = [
+    "VER", "NOR", "PIA", "LEC", "HAM", "RUS", "ANT", "ALO", "STR", "GAS",
+    "OCO", "HUL", "SAI", "TSU", "LAW", "ALB", "COL", "BOR", "HAD", "BEA", "DOO",
+]
+
+# Accent colour per tyre-health stage, used as a left-border "status light"
+# on the Status tile so severity reads at a glance without an emoji.
+STAGE_ACCENTS = {
+    "Optimal": "#2ED573",
+    "Thermal": "#FFC107",
+    "Nearing Cliff": "#FFA502",
+    "Cliff Reached": "#FF4757",
+}
+
+
 @st.cache_data(show_spinner=False)
 def load_sim_laps(year=2024, track="Monza", driver="VER"):
+    """Fetch a driver's race laps plus per-lap weather (FastF1 telemetry + weather API)."""
     try:
         session = fastf1.get_session(year, track, 'R')
         session.load(weather=True)
     except Exception:
         session = fastf1.get_session(2024, track, 'R')
         session.load(weather=True)
-        
+
+    # Keep `laps` as FastF1's own Laps object (untouched) - get_telemetry()
+    # needs its live session reference. Weather is matched up separately, by
+    # LapNumber, rather than merged into `laps` itself (a plain-DataFrame
+    # merge result loses that session link and breaks telemetry lookups).
     laps = session.laps.pick_drivers(driver)
-    
+
+    weather = (
+        session.weather_data[["Time", "AirTemp", "TrackTemp", "Humidity", "WindSpeed", "Rainfall"]]
+        .dropna(subset=["Time"])
+        .sort_values("Time")
+    )
+    lap_weather = pd.merge_asof(
+        laps[["LapNumber", "Time"]].sort_values("Time"), weather, on="Time", direction="backward"
+    ).set_index("LapNumber")
+
     try:
         team_color = fastf1.plotting.get_driver_color(driver, session=session)
     except Exception:
         team_color = '#3671C6'
-        
-    return laps, team_color
+
+    return laps, lap_weather, team_color
+
 
 def get_lap_telemetry(laps, lap_number):
     lap = laps[laps['LapNumber'] == lap_number].iloc[0]
     telemetry = lap.get_telemetry().add_distance()
-    
+
     # Calculate Stress Power
     v_ms = telemetry['Speed'] / 3.6
     time_sec = telemetry['Time'].dt.total_seconds()
@@ -73,103 +117,131 @@ def get_lap_telemetry(laps, lap_number):
     lon_g = savgol_filter(np.gradient(v_ms, time_sec) / 9.81, 15, 3)
     combined_g = np.sqrt(lat_g**2 + lon_g**2)
     telemetry['Stress_Power'] = combined_g * v_ms
-    
+
     return telemetry
 
-def render_sim_frame(placeholder, telemetry, current_idx, team_color, tyre_stage, action, pit_suggestion, active_compound, current_stint, race_lap, current_lap_stress, load, situation_multiplier, sim_state):
+
+def _safe_float(row, column: str, default: float) -> float:
+    value = row.get(column) if hasattr(row, "get") else None
+    return float(value) if value is not None and pd.notna(value) else default
+
+
+def _tile(label: str, value: str, tooltip: str, accent: str = "#4A90E2") -> str:
+    """One compact stat tile for a CSS grid; the tooltip carries detail that
+    would otherwise clutter the label.
+
+    Rendered as a single line with no blank line between tiles: Streamlit's
+    markdown parser treats a blank (or whitespace-only) line as the end of a
+    raw-HTML block, which would make every tile after the first render as
+    literal escaped text instead of HTML.
+    """
+    return (
+        f'<div title="{tooltip}" style="min-width: 0; overflow: hidden; box-sizing: border-box; '
+        f'background: rgba(255,255,255,0.03); padding: 7px 10px; border: 1px solid rgba(255,255,255,0.08); '
+        f'border-left: 3px solid {accent};">'
+        f'<div style="font-family: {MONO}; font-size: 9px; letter-spacing: 0.08em; text-transform: uppercase; '
+        f'color: #888; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">{label}</div>'
+        f'<div style="font-family: {MONO}; font-size: 14px; font-weight: 700; color: #eee; '
+        f'white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">{value}</div>'
+        f'</div>'
+    )
+
+
+def render_sim_frame(placeholder, telemetry, current_idx: int, ctx: dict) -> None:
     current_data = telemetry.iloc[current_idx]
     tel_slice = telemetry.iloc[:current_idx + 1]
-    
+
     with placeholder.container():
-        st.subheader(f"🏎️ Live Race Simulation — Lap {race_lap}")
-        
-        color_map = {"SOFT": "🔴 SOFT", "MEDIUM": "🟡 MEDIUM", "HARD": "⚪ HARD"}
-        compound_display = color_map.get(active_compound, active_compound)
-        deg_rate_str = f"{sim_state.rate_s_per_lap:.2f} ± {np.sqrt(sim_state.covariance[0,0]):.2f}s"
-        
-        metrics_html = f"""
-        <div style="display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 0.5rem; width: 100%;">
-            <div style="flex: 1; min-width: 60px; background: rgba(255,255,255,0.03); padding: 6px; border: 1px solid rgba(255,255,255,0.1);">
-                <div style="font-size: 10px; color: #aaa; white-space: nowrap;">Compound</div>
-                <div style="font-size: 13px; font-weight: bold; white-space: nowrap;">{compound_display}</div>
-            </div>
-            <div style="flex: 1; min-width: 60px; background: rgba(255,255,255,0.03); padding: 6px; border: 1px solid rgba(255,255,255,0.1);">
-                <div style="font-size: 10px; color: #aaa; white-space: nowrap;">Tyre Stage</div>
-                <div style="font-size: 13px; font-weight: bold; white-space: nowrap;">{tyre_stage}</div>
-            </div>
-            <div style="flex: 1; min-width: 60px; background: rgba(255,255,255,0.03); padding: 6px; border: 1px solid rgba(255,255,255,0.1);">
-                <div style="font-size: 10px; color: #aaa; white-space: nowrap;">Action</div>
-                <div style="font-size: 13px; font-weight: bold; white-space: nowrap;">{action}</div>
-            </div>
-            <div style="flex: 1; min-width: 60px; background: rgba(255,255,255,0.03); padding: 6px; border: 1px solid rgba(255,255,255,0.1);">
-                <div style="font-size: 10px; color: #aaa; white-space: nowrap;">Pit Window</div>
-                <div style="font-size: 13px; font-weight: bold; white-space: nowrap;">{pit_suggestion}</div>
-            </div>
-            <div style="flex: 1; min-width: 60px; background: rgba(255,255,255,0.03); padding: 6px; border: 1px solid rgba(255,255,255,0.1);">
-                <div style="font-size: 10px; color: #aaa; white-space: nowrap;">Degradation</div>
-                <div style="font-size: 13px; font-weight: bold; white-space: nowrap;">{deg_rate_str}</div>
-            </div>
-            <div style="flex: 1; min-width: 60px; background: rgba(255,255,255,0.03); padding: 6px; border: 1px solid rgba(255,255,255,0.1);">
-                <div style="font-size: 10px; color: #aaa; white-space: nowrap;">Stress Multiplier</div>
-                <div style="font-size: 13px; font-weight: bold; white-space: nowrap;">{load['multiplier'] * situation_multiplier * current_lap_stress:.2f}x</div>
-            </div>
-            <div style="flex: 1; min-width: 60px; background: rgba(255,255,255,0.03); padding: 6px; border: 1px solid rgba(255,255,255,0.1);">
-                <div style="font-size: 10px; color: #aaa; white-space: nowrap;">Speed</div>
-                <div style="font-size: 13px; font-weight: bold; white-space: nowrap;">{int(current_data['Speed'])} km/h</div>
-            </div>
-            <div style="flex: 1; min-width: 60px; background: rgba(255,255,255,0.03); padding: 6px; border: 1px solid rgba(255,255,255,0.1);">
-                <div style="font-size: 10px; color: #aaa; white-space: nowrap;">Gear</div>
-                <div style="font-size: 13px; font-weight: bold; white-space: nowrap;">{int(current_data['nGear'])}</div>
-            </div>
-            <div style="flex: 1; min-width: 60px; background: rgba(255,255,255,0.03); padding: 6px; border: 1px solid rgba(255,255,255,0.1);">
-                <div style="font-size: 10px; color: #aaa; white-space: nowrap;">RPM</div>
-                <div style="font-size: 13px; font-weight: bold; white-space: nowrap;">{int(current_data['RPM'])}</div>
-            </div>
-            <div style="flex: 1; min-width: 60px; background: rgba(255,255,255,0.03); padding: 6px; border: 1px solid rgba(255,255,255,0.1);">
-                <div style="font-size: 10px; color: #aaa; white-space: nowrap;">Throttle</div>
-                <div style="font-size: 13px; font-weight: bold; white-space: nowrap;">{int(current_data['Throttle'])}%</div>
-            </div>
-        </div>
-        """
-        st.markdown(metrics_html, unsafe_allow_html=True)
-        
+        st.markdown(
+            f"<div style='font-family:{MONO}; font-size:0.95rem; font-weight:700; letter-spacing:0.03em; "
+            f"margin:0 0 0.3rem 0; color:#ddd;'>"
+            f"{ctx['race'].upper()} <span style='color:#555;'>/</span> {ctx['driver']} "
+            f"<span style='color:#555;'>/</span> LAP {ctx['race_lap']:02d}"
+            f"<span style='color:#555;'>/</span>{ctx['max_lap']:02d}"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        # Status gets its own full-width strip - it carries the longest text
+        # (stage + action) and is the single most important readout, so it
+        # should never compete for space or get ellipsis-truncated.
+        st.markdown(
+            f'<div title="Current tyre health stage and recommended action" style="background: rgba(255,255,255,0.04); '
+            f'padding: 8px 12px; border: 1px solid rgba(255,255,255,0.08); border-left: 4px solid {ctx["accent"]}; '
+            f'margin-bottom: 6px; box-sizing: border-box;">'
+            f'<div style="font-family: {MONO}; font-size: 9px; letter-spacing: 0.08em; text-transform: uppercase; color: #888;">STATUS</div>'
+            f'<div style="font-family: {MONO}; font-size: 16px; font-weight: 700; color: #fff;">{ctx["status"]}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        # The rest sit in a CSS grid (not flexbox): auto-fit + minmax guarantees
+        # every tile keeps at least 130px before the grid wraps to a new row,
+        # so tiles can never be squeezed thinner than that - the flexbox
+        # version could shrink indefinitely and made text overlap/collide.
+        tiles = "".join([
+            _tile("Compound", ctx["compound"], "Tyre compound currently fitted", accent="#4A90E2"),
+            _tile("Weather", ctx["weather_value"], ctx["weather_tip"], accent="#17A2B8"),
+            _tile("Cliff", ctx["cliff"], "Tyre age at which modelled cliff risk reaches 80%", accent="#FF4757"),
+            _tile("Pit Window", ctx["pit_window"], "Recommended lap range to box, based on the cliff age", accent="#FFA502"),
+            _tile("Degradation", ctx["degradation"], "Latent pace-loss growth rate per lap, with uncertainty", accent="#4A90E2"),
+            _tile("Stress", ctx["stress"], "Combined wear multiplier from sensors and driving mode", accent="#9B59B6"),
+        ])
+        st.markdown(
+            f'<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); '
+            f'gap: 6px; margin-bottom: 0.35rem;">{tiles}</div>',
+            unsafe_allow_html=True,
+        )
+
+        telemetry_line = (
+            f"SPEED {int(current_data['Speed'])} KM/H &nbsp;&middot;&nbsp; "
+            f"GEAR {int(current_data['nGear'])} &nbsp;&middot;&nbsp; "
+            f"RPM {int(current_data['RPM'])} &nbsp;&middot;&nbsp; "
+            f"THROTTLE {int(current_data['Throttle'])}%"
+        )
+        st.markdown(
+            f'<div style="font-family:{MONO}; font-size:12px; letter-spacing:0.03em; color:#8fd3ff; '
+            f'margin-bottom:0.3rem;">{telemetry_line}</div>',
+            unsafe_allow_html=True,
+        )
+
         # Merge Map and Telemetry into a single Figure for buttery smooth rendering (dpi=70 speeds up streaming)
-        fig = plt.figure(figsize=(12, 4.5), dpi=70)
+        fig = plt.figure(figsize=(11, 5.4), dpi=70)
         fig.patch.set_facecolor('#0e1117')
-        
+
         # Track Map (Left) - Rotated 90 degrees for wider fit
         ax_map = plt.subplot2grid((4, 7), (0, 0), rowspan=4, colspan=3)
         ax_map.set_facecolor('#0e1117')
-        
+
         # Rotate coordinates: X_new = Y, Y_new = -X
         tel_x = telemetry['Y']
         tel_y = -telemetry['X']
         curr_x = current_data['Y']
         curr_y = -current_data['X']
-        
+
         points = np.array([tel_x, tel_y]).T.reshape(-1, 1, 2)
         segments = np.concatenate([points[:-1], points[1:]], axis=1)
-        
+
         # Global cumulative stress scale to prevent flashing
         vmin, vmax = 0.0, 250.0
         norm = mcolors.PowerNorm(gamma=0.5, vmin=vmin, vmax=vmax)
-        
+
         ax_map.plot(tel_x, tel_y, color='#2a2e39', linewidth=6, zorder=1)
         lc = LineCollection(segments, cmap='turbo', norm=norm, linewidth=3.5, zorder=2)
         lc.set_array(telemetry['Stress_Power'][:-1])
         ax_map.add_collection(lc)
-        
+
         ax_map.scatter(curr_x, curr_y, color='white', s=120, edgecolors='#ff4757', linewidth=1.5, zorder=5)
         ax_map.axis('equal')
         ax_map.axis('off')
-        
+
         # Telemetry Channels (Right)
         dist_current = current_data['Distance']
         max_dist = telemetry['Distance'].max()
         channels = [('Speed (km/h)', 'Speed', '#1e90ff'), ('RPM', 'RPM', '#ff4757'), ('Throttle (%)', 'Throttle', '#ffa502'), ('Gear', 'nGear', '#2ed573')]
-        
+
         axs = [plt.subplot2grid((4, 7), (i, 3), colspan=4) for i in range(4)]
-        
+
         for i, (label, col_name, color) in enumerate(channels):
             ax = axs[i]
             ax.set_facecolor('#151922')
@@ -180,17 +252,17 @@ def render_sim_frame(placeholder, telemetry, current_idx, team_color, tyre_stage
             ax.tick_params(colors='white', labelsize=8)
             ax.grid(True, linestyle='--', alpha=0.2)
             ax.set_xlim(0, max_dist)
-            
+
             if col_name == 'nGear':
                 ax.set_yticks(range(1, 9))
                 ax.set_ylim(0, 9)
-            elif col_name == 'Speed': 
+            elif col_name == 'Speed':
                 ax.set_ylim(0, 350)
-            elif col_name == 'RPM': 
+            elif col_name == 'RPM':
                 ax.set_ylim(0, 13000)
-            elif col_name == 'Throttle': 
+            elif col_name == 'Throttle':
                 ax.set_ylim(0, 105)
-            
+
             if i < 3: ax.set_xticklabels([])
 
         axs[-1].set_xlabel('Distance (meters)', color='white')
@@ -215,8 +287,8 @@ def demo_stint(track: str = "Demo Track", compound: str = "SOFT") -> pd.DataFram
     # Steeper degradation curve to ensure the cliff is reached around lap 18
     degradation = np.maximum(0.0, 0.04 * (life - 2) + 0.012 * np.maximum(life - 12, 0) ** 2)
     return pd.DataFrame({
-        "TyreLife": life, 
-        "Degradation_Delta": degradation, 
+        "TyreLife": life,
+        "Degradation_Delta": degradation,
         "Source": "Illustrative demo",
         "Race": track,
         "Driver": "DEMO",
@@ -225,29 +297,10 @@ def demo_stint(track: str = "Demo Track", compound: str = "SOFT") -> pd.DataFram
     })
 
 
-def read_stint(uploaded_file: object | None, track: str = "Demo Track", compound: str = "SOFT") -> pd.DataFrame:
-    if uploaded_file is None:
-        return demo_stint(track, compound)
-    data = pd.read_csv(uploaded_file)
-    missing = {"TyreLife", "Degradation_Delta"}.difference(data.columns)
-    if missing:
-        raise ValueError(f"CSV is missing required column(s): {', '.join(sorted(missing))}")
-    return data.dropna(subset=["TyreLife", "Degradation_Delta"]).sort_values("TyreLife")
-
-
-def stint_choices(data: pd.DataFrame) -> dict[str, pd.DataFrame]:
-    """Split pipeline output into labelled, single-stint dashboard inputs."""
-    if "Stint_ID" not in data.columns:
-        return {"Uploaded stint": data}
-    choices: dict[str, pd.DataFrame] = {}
-    for stint_id, part in data.groupby("Stint_ID", sort=False):
-        first = part.iloc[0]
-        prefix = " | ".join(str(first.get(column, "Unknown")) for column in ("Race", "Driver", "Compound"))
-        choices[f"{prefix} | stint {stint_id}"] = part.sort_values("TyreLife").copy()
-    return choices
-
-
-def fan_chart(observed: pd.DataFrame, forecast: pd.DataFrame, title: str) -> go.Figure:
+def fan_chart(observed: pd.DataFrame, forecast: pd.DataFrame) -> go.Figure:
+    """Build the pace-loss fan chart for the compact side panel (no in-figure
+    title or legend - both would overlap a narrow column; colours and the
+    cliff line are enough to read once the reader knows the app)."""
     fig = go.Figure()
     if not observed.empty:
         if "Latent_Degradation_Mean" in observed:
@@ -286,7 +339,11 @@ def fan_chart(observed: pd.DataFrame, forecast: pd.DataFrame, title: str) -> go.
         mode='lines', name="Forecast mean", line=dict(color="#FF4B4B", width=3)
     ))
 
-    fig.add_hline(y=1.5, line_dash="dash", line_color="#FF4B4B", opacity=0.7, annotation_text="1.5s cliff risk", annotation_position="top left", annotation_font=dict(color="#FF4B4B"))
+    fig.add_hline(
+        y=1.5, line_dash="dash", line_color="#FF4B4B", opacity=0.7,
+        annotation_text="1.5s CLIFF RISK", annotation_position="top left",
+        annotation_font=dict(color="#FF4B4B", size=10, family=MONO),
+    )
 
     max_y = 2.5
     if not observed.empty:
@@ -300,135 +357,112 @@ def fan_chart(observed: pd.DataFrame, forecast: pd.DataFrame, title: str) -> go.
     fig.add_hrect(y0=1.5, y1=max_y, fillcolor="rgba(255, 0, 0, 0.05)", line_width=0, layer="below")
 
     fig.update_layout(
-        title=title,
-        xaxis_title="Tyre life (laps)",
-        yaxis_title="Fuel-corrected pace loss (s)",
+        title="",
+        xaxis_title="TYRE LIFE (LAPS)",
+        yaxis_title="PACE LOSS (S)",
         yaxis=dict(range=[0, max_y]),
         hovermode="x unified",
         template="plotly_dark",
         plot_bgcolor="rgba(0,0,0,0)",
         paper_bgcolor="rgba(0,0,0,0)",
-        margin=dict(l=40, r=40, t=60, b=40),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        showlegend=False,
+        height=500,
+        margin=dict(l=45, r=15, t=15, b=40),
+        font=dict(family=MONO, size=11),
     )
     return fig
 
 
 def main() -> None:
-    st.set_page_config(page_title="Tyre State Intelligence", layout="wide")
-    
-    st.markdown("""
+    st.set_page_config(page_title="TrackShift — Tyre Telemetry", layout="wide")
+
+    st.markdown(f"""
         <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap');
-        html, body, [class*="css"] {
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap');
+        html, body, [class*="css"] {{
             font-family: 'Inter', sans-serif;
-        }
-        .block-container {
-            padding-top: 1rem;
-            padding-bottom: 0rem;
+        }}
+        .block-container {{
+            padding-top: 3.5rem;
+            padding-bottom: 0.5rem;
             max-width: 100%;
-        }
-        [data-testid="stMetric"] {
-            background-color: rgba(255, 255, 255, 0.03);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            padding: 0.2rem 0.5rem;
-            border-radius: 0px;
-            box-shadow: none;
-        }
-        [data-testid="stMetricLabel"] {
-            font-size: 0.75rem !important;
-            white-space: nowrap !important;
-            overflow: visible !important;
-            text-overflow: clip !important;
-        }
-        [data-testid="stMetricValue"] {
-            font-size: 1.1rem !important;
-        }
-        [data-testid="column"] {
-            padding: 0 0.1rem;
-        }
-        h3 {
-            margin-top: 0 !important;
-            padding-top: 0 !important;
-        }
-        [data-testid="stMetric"]:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 6px 12px rgba(0,0,0,0.2);
-            border-color: rgba(255, 75, 75, 0.4);
-        }
-        .stTabs [data-baseweb="tab-list"] {
-            gap: 1.5rem;
-        }
-        .stTabs [data-baseweb="tab"] {
-            padding: 1rem 0;
-            border-radius: 0;
-        }
-        .stTabs [aria-selected="true"] {
-            background-color: transparent !important;
-            border-bottom: 2px solid #FF4B4B !important;
-        }
+        }}
+        [data-testid="stVerticalBlock"] {{
+            gap: 0.4rem;
+        }}
+        [data-testid="stMetric"], .stSlider, .stToggle, .stSelectSlider {{
+            min-width: 0;
+        }}
+        [data-testid="column"] {{
+            padding: 0 0.15rem;
+            min-width: 0;
+        }}
+        hr {{
+            margin: 0.3rem 0 !important;
+        }}
+        [data-testid="stCaptionContainer"] p {{
+            margin-bottom: 0 !important;
+        }}
+        [data-testid="stSidebar"] {{
+            background-image: linear-gradient(rgba(255,255,255,0.015) 1px, transparent 1px),
+                               linear-gradient(90deg, rgba(255,255,255,0.015) 1px, transparent 1px);
+            background-size: 18px 18px;
+        }}
+        [data-testid="stSidebarHeader"] {{ padding-bottom: 0; }}
+        .stTabs {{ display: none; }}
         </style>
     """, unsafe_allow_html=True)
-    
-    st.title("Beyond Curve Fitting — Tyre State Intelligence")
-    st.caption("Fuel-corrected observations update a latent degradation state; bands are model uncertainty, not guaranteed pace.")
-    
-    st.sidebar.header("Data Source")
+
+    st.markdown(
+        f"<div style='display:flex; align-items:center; gap:0.5rem; padding-bottom:0.4rem; "
+        f"border-bottom:1px solid rgba(255,255,255,0.08); margin-bottom:0.5rem;'>"
+        f"<span style='width:8px; height:8px; border-radius:50%; background:#FF4757; display:inline-block; "
+        f"box-shadow:0 0 6px #FF4757;'></span>"
+        f"<span style='font-family:{MONO}; font-size:1.15rem; font-weight:700; letter-spacing:0.06em; "
+        f"text-transform:uppercase; color:#fff;'>TrackShift</span>"
+        f"<span style='font-family:{MONO}; font-size:0.75rem; color:#666; letter-spacing:0.04em;'>"
+        f"// LATENT TYRE-STATE TELEMETRY</span>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    st.sidebar.header("Race Setup")
     import glob
     local_files = glob.glob("outputs/latent_stint_observations_*.csv") + glob.glob("latent_stint_observations_*.csv")
     upload = local_files[-1] if local_files else None
 
+    uploaded_data = pd.DataFrame()
+    selected_race = selected_driver = None
     if upload is None:
-        st.sidebar.warning("No latent_stint_observations CSV found locally. Using Demo Mode.")
-
-    if upload is not None:
+        st.sidebar.caption("No stint data found locally — showing demo mode.")
+    else:
         try:
             uploaded_data = pd.read_csv(upload)
-            # Remove inference columns if present
             inference_cols = ["Latent_Degradation_Mean", "Latent_Degradation_Std", "Prior_Degradation_Mean", "Prior_Degradation_Std", "Latent_Degradation_Rate"]
             uploaded_data = uploaded_data.drop(columns=[c for c in inference_cols if c in uploaded_data.columns])
         except Exception as e:
             st.error(f"Error loading CSV: {e}")
             return
-            
-        st.sidebar.header("Stint Selection")
+
         races = uploaded_data["Race"].unique().tolist() if "Race" in uploaded_data.columns else ["Unknown"]
         selected_race = st.sidebar.selectbox("Select Race", races)
         race_data = uploaded_data[uploaded_data["Race"] == selected_race] if "Race" in uploaded_data.columns else uploaded_data
-        
+
         drivers = race_data["Driver"].unique().tolist() if "Driver" in race_data.columns else ["Unknown"]
         selected_driver = st.sidebar.selectbox("Select Driver", drivers)
-        driver_data = race_data[race_data["Driver"] == selected_driver] if "Driver" in race_data.columns else race_data
-        
-        stints = driver_data["Stint_ID"].unique().tolist() if "Stint_ID" in driver_data.columns else [1]
-        stint_options = []
-        for s in stints:
-            comp = driver_data[driver_data["Stint_ID"] == s]["Compound"].iloc[0] if "Compound" in driver_data.columns else "Unknown"
-            stint_options.append(f"Stint {s} ({comp})")
-            
-        selected_stint_idx = st.sidebar.selectbox("Select Stint", range(len(stints)), format_func=lambda x: stint_options[x])
-        stint = driver_data[driver_data["Stint_ID"] == stints[selected_stint_idx]].sort_values("TyreLife").copy()
-    else:
-        st.sidebar.header("Demo Configuration")
-        track_choice = st.sidebar.selectbox("Track / Circuit", [
-            "Bahrain", "Saudi Arabia", "Australia", "Japan", "China", "Miami", "Emilia Romagna",
-            "Monaco", "Canada", "Spain", "Austria", "Great Britain", "Hungary", "Belgium",
-            "Netherlands", "Italy", "Azerbaijan", "Singapore", "United States", "Mexico",
-            "Brazil", "Las Vegas", "Qatar", "Abu Dhabi"
-        ])
-        tyre_choice = st.sidebar.selectbox("Tyre Compound", ["SOFT", "MEDIUM", "HARD"])
-        stint = demo_stint(track_choice, tyre_choice)
-        st.info("Showing an illustrative demo stint. Run the pipeline and upload its exported latent_stint_observations CSV for real data.")
 
     with st.sidebar.expander("Virtual Sensor Setup", expanded=False):
-        track_temp = st.slider("Track temperature (°C)", 15, 60, 35)
+        use_live_weather = st.checkbox(
+            "Use live weather for track temp", value=True,
+            help="On: track temperature comes from FastF1's per-lap weather data. Off: use the slider below instead.",
+        )
+        track_temp_override = st.slider("Track temperature (°C)", 15, 60, 35, disabled=use_live_weather)
         severity = st.slider("Track tyre-stress score", 1.0, 5.0, 3.0, 0.1)
         profile = {"traction": 3.0, "tyre_stress": severity, "lateral": 3.0, "braking": 3.0, "downforce": 3.0}
-        sensor = default_sensor_state(profile, float(track_temp))
-        sensor["wheel_slip_pct"] = st.slider("Wheel slip (%)", 2.0, 12.0, float(sensor["wheel_slip_pct"]), .1)
-        sensor["carcass_temp_c"] = st.slider("Carcass temperature (°C)", 70.0, 125.0, float(sensor["carcass_temp_c"]), .5)
-    load = wear_load_breakdown(sensor)
-    
+        seed_sensor = default_sensor_state(profile, 35.0)
+        wheel_slip_override = st.slider("Wheel slip (%)", 2.0, 12.0, float(seed_sensor["wheel_slip_pct"]), .1)
+        carcass_temp_override = st.slider("Carcass temperature (°C)", 70.0, 125.0, float(seed_sensor["carcass_temp_c"]), .5)
+
     st.sidebar.header("Driving Situation")
     situation = st.sidebar.radio("Current Mode", ["Standard", "Aggressive / Pushing", "Traffic / Dirty Air", "Conserving"])
     situation_multiplier = 1.0
@@ -440,189 +474,140 @@ def main() -> None:
         situation_multiplier = 0.85
 
     model = load_model()
-    live_tab, sim_tab, validation_tab, eval_tab = st.tabs(["🔴 Live Weekend", "🏎️ Live Simulation", "🏁 Post-Race Validation", "💡 Framework Evaluation"])
 
-    with sim_tab:
-        st.markdown("### Monza 2025: Verstappen (VER)")
-        with st.spinner("Loading race data..."):
-            sim_laps, team_color = load_sim_laps(2025, "Monza", "VER")
-            
-        ver_data = pd.DataFrame()
-        if upload is not None and not uploaded_data.empty:
-            if "Driver" in uploaded_data.columns:
-                is_monza = pd.Series(False, index=uploaded_data.index)
-                if "Race" in uploaded_data.columns:
-                    is_monza |= uploaded_data["Race"].str.contains("Monza|Italian", na=False, case=False)
-                if "Circuit" in uploaded_data.columns:
-                    is_monza |= uploaded_data["Circuit"].str.contains("Monza", na=False, case=False)
-                ver_data = uploaded_data[(uploaded_data["Driver"] == "VER") & is_monza]
-        
-        if ver_data.empty:
-            st.info("Using Demo Data (Upload valid CSV for real predictions).")
-            
-        max_lap = int(sim_laps['LapNumber'].max())
-        
-        play_animation = st.toggle("▶ Run Continuous Race Replay", value=False)
-        
-        c_slider1, c_slider2 = st.columns(2)
-        start_lap = c_slider1.slider("Current Race Lap", 1, max_lap, 1)
-        playback_speed = c_slider2.select_slider("Playback Speed", options=["1x", "2x", "4x", "8x", "16x", "32x"], value="4x")
-        
-        speed_multiplier = int(playback_speed.replace("x", ""))
-        step_size = max(1, speed_multiplier)
-        
-        col_main, col_fan = st.columns([2.5, 1])
-        with col_main:
-            main_placeholder = st.empty()
-        with col_fan:
-            fan_placeholder = st.empty()
-        
-        def run_lap(race_lap, is_animating):
-            try:
-                lap_info = sim_laps.loc[sim_laps['LapNumber'] == race_lap].iloc[0]
-                sim_tel = get_lap_telemetry(sim_laps, race_lap)
-            except Exception:
-                return
-                
-            current_stint = lap_info['Stint']
-            current_tyre_life = lap_info['TyreLife']
-            active_compound = lap_info['Compound']
-            
-            stint_data = ver_data[ver_data["Stint_ID"] == current_stint] if "Stint_ID" in ver_data.columns else pd.DataFrame()
-            if stint_data.empty:
-                stint_data = demo_stint("Monza", str(active_compound))
-                
-            sim_observed = stint_data[stint_data["TyreLife"] <= current_tyre_life].copy()
-            if sim_observed.empty:
-                sim_observed = stint_data.iloc[[0]].copy()
-                
-            current_lap_stress = 1.0
-            if not sim_observed.empty and "Degradation_Delta" in sim_observed.columns:
-                current_lap_stress = 1.0 + (float(sim_observed.iloc[-1]["Degradation_Delta"]) * 0.1)
-                
-            sim_posterior = model.infer_stint(sim_observed, wear_multiplier=load["multiplier"])
-            sim_state_row = sim_posterior.iloc[-1]
-            sim_state = model.initial_state(float(sim_state_row["TyreLife"]), load["multiplier"])
-            sim_state.mean_s, sim_state.rate_s_per_lap = float(sim_state_row["Latent_Degradation_Mean"]), float(sim_state_row["Latent_Degradation_Rate"])
-            sim_state.covariance[0, 0] = float(sim_state_row["Latent_Degradation_Std"]) ** 2
-            sim_state.rate_s_per_lap = sim_state.rate_s_per_lap * situation_multiplier * load["multiplier"] * current_lap_stress
-            
-            sim_horizon = np.arange(float(sim_state.tyre_life), float(sim_state.tyre_life) + 16)
-            sim_forecast = model.forecast(sim_state, sim_horizon)
-            sim_cliff_lap = first_cliff_forecast(sim_forecast)
-            
-            if sim_state.mean_s < 0.5: sim_tyre_stage, sim_action = "🟢 Optimal", "Maintain Pace"
-            elif sim_state.mean_s < 1.0: sim_tyre_stage, sim_action = "🟡 Thermal", "Monitor"
-            elif sim_state.mean_s < 1.5: sim_tyre_stage, sim_action = "🟠 Nearing Cliff", "PREPARE TO PIT"
-            else: sim_tyre_stage, sim_action = "🔴 Cliff Reached", "PIT IMMEDIATELY"
+    if upload is not None and not uploaded_data.empty:
+        sim_race, sim_driver = selected_race, selected_driver
+    else:
+        demo_col1, demo_col2 = st.columns(2)
+        sim_race = demo_col1.selectbox("Track / Circuit", DEMO_TRACK_CHOICES, index=DEMO_TRACK_CHOICES.index("Italian Grand Prix"))
+        sim_driver = demo_col2.selectbox("Driver", KNOWN_2025_DRIVERS, index=KNOWN_2025_DRIVERS.index("VER"))
 
-            sim_pit_suggestion = f"Lap {int(sim_cliff_lap) - 2}–{int(sim_cliff_lap)}" if sim_cliff_lap else "Stable (>15L)"
-            
-            with fan_placeholder.container():
-                st.subheader(f"Strategy Forecast")
-                st.plotly_chart(fan_chart(sim_posterior, sim_forecast, f"Lap {race_lap} Forecast"), use_container_width=True, key=f"fan_{race_lap}")
+    with st.spinner("Loading race + weather data..."):
+        sim_laps, lap_weather, team_color = load_sim_laps(2025, sim_race, sim_driver)
 
-            total_points = len(sim_tel)
-            if is_animating:
-                for idx in range(0, total_points, step_size):
-                    render_sim_frame(main_placeholder, sim_tel, idx, team_color, sim_tyre_stage, sim_action, sim_pit_suggestion, active_compound, current_stint, race_lap, current_lap_stress, load, situation_multiplier, sim_state)
-            else:
-                render_sim_frame(main_placeholder, sim_tel, total_points - 1, team_color, sim_tyre_stage, sim_action, sim_pit_suggestion, active_compound, current_stint, race_lap, current_lap_stress, load, situation_multiplier, sim_state)
-        
-        if play_animation:
-            for r_lap in range(start_lap, max_lap + 1):
-                run_lap(r_lap, True)
+    ver_data = pd.DataFrame()
+    if upload is not None and not uploaded_data.empty and {"Driver", "Race"}.issubset(uploaded_data.columns):
+        ver_data = uploaded_data[(uploaded_data["Driver"] == sim_driver) & (uploaded_data["Race"] == sim_race)]
+
+    if ver_data.empty:
+        st.caption("Demo data — upload a latent_stint_observations CSV for real predictions.")
+
+    max_lap = int(sim_laps['LapNumber'].max())
+
+    ctrl1, ctrl2, ctrl3 = st.columns([1, 1.6, 1])
+    play_animation = ctrl1.toggle("Continuous Replay", value=False)
+    start_lap = ctrl2.slider("Race Lap", 1, max_lap, 1)
+    playback_speed = ctrl3.select_slider("Playback Speed", options=["1x", "2x", "4x", "8x", "16x", "32x"], value="4x")
+
+    speed_multiplier = int(playback_speed.replace("x", ""))
+    step_size = max(1, speed_multiplier)
+
+    col_main, col_fan = st.columns([1.8, 1])
+    with col_main:
+        main_placeholder = st.empty()
+    with col_fan:
+        fan_placeholder = st.empty()
+
+    def run_lap(race_lap, is_animating):
+        try:
+            lap_info = sim_laps.loc[sim_laps['LapNumber'] == race_lap].iloc[0]
+            sim_tel = get_lap_telemetry(sim_laps, race_lap)
+        except Exception:
+            return
+
+        current_stint = lap_info['Stint']
+        current_tyre_life = lap_info['TyreLife']
+        active_compound = lap_info['Compound']
+
+        # Weather as a live predictive input: real per-lap track temperature
+        # (not a manual slider) drives the virtual-sensor thermal/pressure
+        # state, which in turn scales the degradation forecast below.
+        try:
+            weather_row = lap_weather.loc[race_lap]
+        except KeyError:
+            weather_row = pd.Series(dtype=float)
+        live_track_temp = _safe_float(weather_row, "TrackTemp", 35.0)
+        live_air_temp = _safe_float(weather_row, "AirTemp", 22.0)
+        live_humidity = _safe_float(weather_row, "Humidity", 50.0)
+        live_wind = _safe_float(weather_row, "WindSpeed", 0.0)
+        live_rain = bool(weather_row["Rainfall"]) if "Rainfall" in weather_row and pd.notna(weather_row["Rainfall"]) else False
+
+        effective_track_temp = live_track_temp if use_live_weather else float(track_temp_override)
+        sensor = default_sensor_state(profile, effective_track_temp)
+        sensor["wheel_slip_pct"] = wheel_slip_override
+        sensor["carcass_temp_c"] = carcass_temp_override
+        load = wear_load_breakdown(sensor)
+
+        weather_value = f"{live_track_temp:.0f}°C · {'WET' if live_rain else 'DRY'}"
+        weather_tip = (
+            f"Track {live_track_temp:.1f}°C · Air {live_air_temp:.1f}°C · "
+            f"Humidity {live_humidity:.0f}% · Wind {live_wind:.1f} km/h · "
+            f"{'Rain — model trained on dry stints only, treat as indicative' if live_rain else 'Dry'}"
+            + ("" if use_live_weather else f" · Model is using the manual {track_temp_override:.0f}°C override, not this reading")
+        )
+
+        stint_data = ver_data[ver_data["Stint_ID"] == current_stint] if "Stint_ID" in ver_data.columns else pd.DataFrame()
+        if stint_data.empty:
+            stint_data = demo_stint(sim_race, str(active_compound))
+
+        sim_observed = stint_data[stint_data["TyreLife"] <= current_tyre_life].copy()
+        if sim_observed.empty:
+            sim_observed = stint_data.iloc[[0]].copy()
+
+        current_lap_stress = 1.0
+        if not sim_observed.empty and "Degradation_Delta" in sim_observed.columns:
+            current_lap_stress = 1.0 + (float(sim_observed.iloc[-1]["Degradation_Delta"]) * 0.1)
+
+        sim_posterior = model.infer_stint(sim_observed, wear_multiplier=load["multiplier"])
+        sim_state_row = sim_posterior.iloc[-1]
+        sim_state = model.initial_state(float(sim_state_row["TyreLife"]), load["multiplier"])
+        sim_state.mean_s, sim_state.rate_s_per_lap = float(sim_state_row["Latent_Degradation_Mean"]), float(sim_state_row["Latent_Degradation_Rate"])
+        sim_state.covariance[0, 0] = float(sim_state_row["Latent_Degradation_Std"]) ** 2
+        sim_state.rate_s_per_lap = sim_state.rate_s_per_lap * situation_multiplier * load["multiplier"] * current_lap_stress
+
+        sim_horizon = np.arange(float(sim_state.tyre_life), float(sim_state.tyre_life) + 16)
+        sim_forecast = model.forecast(sim_state, sim_horizon)
+        sim_cliff_lap = first_cliff_forecast(sim_forecast)
+
+        if sim_state.mean_s < 0.5: sim_tyre_stage, sim_action = "Optimal", "Maintain Pace"
+        elif sim_state.mean_s < 1.0: sim_tyre_stage, sim_action = "Thermal", "Monitor"
+        elif sim_state.mean_s < 1.5: sim_tyre_stage, sim_action = "Nearing Cliff", "Prepare To Pit"
+        else: sim_tyre_stage, sim_action = "Cliff Reached", "Pit Immediately"
+
+        deg_rate_str = f"{sim_state.rate_s_per_lap:.2f}±{np.sqrt(sim_state.covariance[0,0]):.2f}s"
+        stress_value = load['multiplier'] * situation_multiplier * current_lap_stress
+
+        ctx = {
+            "race": sim_race, "driver": sim_driver, "race_lap": race_lap, "max_lap": max_lap,
+            "status": f"{sim_tyre_stage} — {sim_action}", "accent": STAGE_ACCENTS.get(sim_tyre_stage, "#4A90E2"),
+            "compound": str(active_compound),
+            "weather_value": weather_value, "weather_tip": weather_tip,
+            "cliff": f"Lap {int(sim_cliff_lap)}" if sim_cliff_lap else "Stable",
+            "pit_window": f"Lap {int(sim_cliff_lap) - 2}-{int(sim_cliff_lap)}" if sim_cliff_lap else "Stable (>15L)",
+            "degradation": deg_rate_str,
+            "stress": f"{stress_value:.2f}x",
+        }
+
+        with fan_placeholder.container():
+            st.markdown(
+                f"<div style='font-family:{MONO}; font-size:0.95rem; font-weight:700; letter-spacing:0.03em; "
+                f"margin:0 0 0.3rem 0; color:#ddd;'>STRATEGY FORECAST</div>",
+                unsafe_allow_html=True,
+            )
+            st.plotly_chart(fan_chart(sim_posterior, sim_forecast), use_container_width=True, key=f"fan_{race_lap}")
+
+        total_points = len(sim_tel)
+        if is_animating:
+            for idx in range(0, total_points, step_size):
+                render_sim_frame(main_placeholder, sim_tel, idx, ctx)
         else:
-            run_lap(start_lap, False)
+            render_sim_frame(main_placeholder, sim_tel, total_points - 1, ctx)
 
-    with live_tab:
-        count = st.slider("Completed clean laps across FP1 → FP3", 1, len(stint), max(1, len(stint) // 2))
-        observed = stint.iloc[:count].copy()
-        posterior = model.infer_stint(observed, wear_multiplier=load["multiplier"])
-        state_row = posterior.iloc[-1]
-        state = model.initial_state(float(state_row["TyreLife"]), load["multiplier"])
-        state.mean_s, state.rate_s_per_lap = float(state_row["Latent_Degradation_Mean"]), float(state_row["Latent_Degradation_Rate"])
-        # Reconstruct covariance from reported state uncertainty; the rate
-        # covariance stays conservative, as only its display is unavailable.
-        state.covariance[0, 0] = float(state_row["Latent_Degradation_Std"]) ** 2
-
-        # Apply multipliers so that virtual sensors and driving situation reactively change the forecast line
-        state.rate_s_per_lap = state.rate_s_per_lap * situation_multiplier * load["multiplier"]
-
-        horizon = np.arange(float(state.tyre_life), float(state.tyre_life) + 16)
-        forecast = model.forecast(state, horizon)
-        cliff_lap = first_cliff_forecast(forecast)
-        
-        if state.mean_s < 0.5:
-            tyre_stage = "🟢 Optimal Grip"
-            action = "Maintain Pace"
-        elif state.mean_s < 1.0:
-            tyre_stage = "🟡 Thermal Deg"
-            action = "Monitor Strategy"
-        elif state.mean_s < 1.5:
-            tyre_stage = "🟠 Nearing Cliff"
-            action = "PREPARE TO PIT"
-        else:
-            tyre_stage = "🔴 Cliff Reached"
-            action = "PIT IMMEDIATELY"
-
-        if cliff_lap is not None:
-            pit_suggestion = f"Lap {int(cliff_lap) - 2} – {int(cliff_lap)}"
-        else:
-            pit_suggestion = "Stable (>15 Laps)"
-
-        st.subheader("Strategy Overview")
-        a, b, c, d = st.columns(4)
-        a.metric("Current Tyre Stage", tyre_stage)
-        b.metric("Strategy Recommendation", action)
-        c.metric("Suggested Pit Window", pit_suggestion)
-        d.metric("Current Pace Loss", f"{state.mean_s:.2f} ± {state.std_s:.2f} s")
-        
-        st.plotly_chart(fan_chart(posterior, forecast, "Live weekend posterior and race forecast"), use_container_width=True)
-        st.caption("Update behaviour is sequential: each clean practice lap changes the posterior and its uncertainty. Slow outliers are innovation-clipped rather than treated as tyre failure.")
-
-        st.divider()
-        st.subheader("Virtual Sensor Breakdown")
-        st.caption("Identify which physical factors are currently driving tyre wear. A multiplier > 1.0 accelerates degradation.")
-        cols = st.columns(5)
-        cols[0].metric("Thermal Stress", f"{load['thermal']:.2f}x")
-        cols[1].metric("Slip Energy", f"{load['slip']:.2f}x")
-        cols[2].metric("Lateral Load", f"{load['lateral']:.2f}x")
-        cols[3].metric("Pressure Deviation", f"{load['pressure']:.2f}x")
-        cols[4].metric("Overall Wear Modifier", f"{load['multiplier']:.2f}x")
-
-    with validation_tab:
-        posterior = model.infer_stint(stint, wear_multiplier=load["multiplier"])
-        last = posterior.iloc[-1]
-        state = model.initial_state(float(last["TyreLife"]), load["multiplier"])
-        state.mean_s, state.rate_s_per_lap = float(last["Latent_Degradation_Mean"]), float(last["Latent_Degradation_Rate"])
-        state.covariance[0, 0] = float(last["Latent_Degradation_Std"]) ** 2
-        forecast = model.forecast(state, np.arange(float(state.tyre_life), float(state.tyre_life) + 8))
-        st.plotly_chart(fan_chart(posterior, forecast, "Post-Race Validation: Actual vs. Forecast"), use_container_width=True)
-        coverage = np.mean((posterior["Degradation_Delta"] >= posterior["Latent_Degradation_Mean"] - 1.645 * posterior["Latent_Degradation_Std"]) & (posterior["Degradation_Delta"] <= posterior["Latent_Degradation_Mean"] + 1.645 * posterior["Latent_Degradation_Std"]))
-        st.metric("In-sample 90% posterior-band coverage", f"{coverage:.0%}")
-        st.caption("Coverage is a calibration diagnostic, not a race-performance score. Use a held-out race for an honest validation result.")
-
-    with eval_tab:
-        st.header("Why Probabilistic Latent Modelling?")
-        st.markdown("""
-        In Formula 1, predicting a single deterministic lap time (e.g., 1:34.5) is insufficient for high-stakes decision making. 
-        Race engineers need to manage **risk**, which requires an understanding of **uncertainty** and **probability**.
-
-        ### The Pit Wall Problem
-        Traditional public-data models treat tyre wear as a curve-fitting exercise on lap times. If a model has a 0.3s Mean Absolute Error (MAE), it still doesn't tell the race engineer if the tyre is going to suddenly fall off a "cliff" in the next 5 laps.
-
-        ### Our Solution
-        This portal solves the problem by transitioning to **inferring latent tyre states** using State-Space models (Kalman Filters):
-        1. **Virtual Sensor Emulation Layer**: Recreates missing physical CAN-bus signals (carcass temp, slip energy) using Track Profiles & FastF1 telemetry. It mirrors how real F1 teams operate when competitor data is hidden.
-        2. **Probabilistic Cliff Detection**: Instead of a single MAE metric, this model outputs a probability distribution. It answers the question: *What is the probability that the pace drop exceeds 1.5s on Lap 44?*
-        3. **Recursive Weekend Learning**: The model leverages prior race data but updates its state automatically via Bayesian inference as FP1, FP2, and FP3 unfold, adapting to the track's evolution for that specific weekend.
-
-        ### Benefits for the Race Strategy Team
-        - **Trust & Explainability**: The pit wall inherently distrusts black-box AI. By providing an 80% risk threshold (the *cliff-risk age* metric in the Live Weekend tab), engineers can make decisions based on risk tolerance.
-        - **Handling Anomalies**: The model inherently filters out traffic or driver mistakes as observation noise, preventing knee-jerk strategy calls based on an isolated slow lap.
-        - **Visual Validation**: The Fan Charts allow strategists to visually confirm that the actual race pace falls within the model's predicted uncertainty bounds.
-        """)
+    if play_animation:
+        for r_lap in range(start_lap, max_lap + 1):
+            run_lap(r_lap, True)
+    else:
+        run_lap(start_lap, False)
 
 
 if __name__ == "__main__":

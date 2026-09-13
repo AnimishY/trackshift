@@ -1,3 +1,4 @@
+import argparse
 import os
 import fastf1
 import fastf1.plotting
@@ -8,6 +9,12 @@ import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 import matplotlib.colors as mcolors
 
+parser = argparse.ArgumentParser(description="Track-map tyre stress heatmap for one driver's fastest lap.")
+parser.add_argument("--year", type=int, default=2025)
+parser.add_argument("--track", default="Monza", help="FastF1 event name, e.g. Monza, Silverstone, Austria")
+parser.add_argument("--driver", default="VER", help="Three-letter driver code, e.g. VER, NOR")
+args = parser.parse_args()
+
 # 1. Setup cache
 cache_dir = 'fastf1_cache'
 if not os.path.exists(cache_dir):
@@ -15,10 +22,10 @@ if not os.path.exists(cache_dir):
 fastf1.Cache.enable_cache(cache_dir)
 
 # 2. Load Session and Lap Data
-session = fastf1.get_session(2025, 'Monza', 'R')
+session = fastf1.get_session(args.year, args.track, 'R')
 session.load()
 
-lap = session.laps.pick_drivers('VER').pick_fastest()
+lap = session.laps.pick_drivers(args.driver).pick_fastest()
 tel = lap.get_telemetry().add_distance()
 
 # 3. Convert units and prepare time intervals
@@ -67,7 +74,7 @@ lc = LineCollection(segments, cmap='turbo', norm=norm, linewidth=3.5, zorder=2)
 lc.set_array(tel['Stress_Power'][:-1])
 line = ax.add_collection(lc)
 
-ax.set_title("Monza: Tyre Degradation & Stress Heatmap (Verstappen)", 
+ax.set_title(f"{session.event['EventName']}: Tyre Degradation & Stress Heatmap ({args.driver})",
              color='white', fontsize=14, pad=15, fontweight='bold')
 ax.axis('equal')
 ax.axis('off')
